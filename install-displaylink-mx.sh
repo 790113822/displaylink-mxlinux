@@ -5,20 +5,26 @@
 #  DisplayLink 驱动自动安装 + 配置 + 开机自启动脚本（面向 MX Linux）
 #
 #  特性：
-#    * 自动检测 MX Linux（含 AHS），自动识别 systemd / sysvinit(runit) 两种
+#    * 自动检测 MX Linux（含 AHS），自动识别 systemd / runit / sysvinit 三种
 #      init 系统并分别配置开机自启动
-#    * 优先使用 Synaptics 官方 APT 仓库安装（版本自动跟随官方更新），
-#      并搭配 MX/社区维护的 evdi-dkms（DKMS 自动为每个内核编译 evdi 模块）
-#    * 若系统已装 DisplayLink（APT 或 /opt/displaylink .run 方式），本脚本会
-#      自动识别并只补齐配置与开机自启动，不会重复安装（幂等）
+#    * 使用 Synaptics 官方 standalone 安装包（.run）：自动从官方下载页解析
+#      最新版本 → 下载 .zip → 解压 .run → 运行官方 installer
+#      （不再添加 / 使用 Synaptics APT 仓库）
+#    * 支持离线安装：--run-file 指定本地 .zip / .run 安装包；
+#      --run-url 指定 .zip / .run 下载地址
+#    * 若系统已装 DisplayLink（.run 方式），本脚本会识别并只补齐配置与
+#      开机自启动，不会重复安装（幂等）；旧的 APT 版本会先卸载以避免冲突
 #    * 自动安装缺失的系统依赖（linux-headers、dkms、unzip、wget 等）
 #    * 自动处理 udl/udlfb 内核模块黑名单（避免与 evdi 显示冲突）
-#    * 自动配置 udev 规则、evdi 开机加载、systemd 服务 / sysvinit init 脚本
+#    * 自动配置 udev 规则、evdi 开机加载、systemd 服务 / runit 服务 /
+#      sysvinit init 脚本
 #
 #  用法：
-#    sudo ./install-displaylink-mx.sh             # 安装 + 配置开机自启动
-#    sudo ./install-displaylink-mx.sh --status    # 只查看状态
-#    sudo ./install-displaylink-mx.sh --uninstall # 彻底卸载
+#    sudo ./install-displaylink-mx.sh                  # 下载 .run 并安装 + 开机自启动
+#    sudo ./install-displaylink-mx.sh --run-file F.run # 使用本地安装包（离线安装）
+#    sudo ./install-displaylink-mx.sh --run-url URL    # 指定 .zip / .run 下载地址
+#    sudo ./install-displaylink-mx.sh --status         # 只查看状态
+#    sudo ./install-displaylink-mx.sh --uninstall      # 彻底卸载
 #
 #  运行后建议重启（脚本最后会询问是否立即重启）
 # =============================================================================
@@ -29,19 +35,27 @@ IFS=$'\n\t'
 # ----------------------------- 基础信息 -----------------------------
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 LOG_FILE="/var/log/displaylink-mx-install.log"
-VERSION="1.0.0"
+VERSION="1.1.0"
 
-# Synaptics 官方 APT 仓库（官方维护，版本自动更新）
-SYNAPTICS_APT_LINE="deb [signed-by=/usr/share/keyrings/synaptics-repository-keyring.gpg] https://www.synaptics.com/sites/default/files/Ubuntu stable non-free"
-SYNAPTICS_KEYRING_URL="https://www.synaptics.com/sites/default/files/synaptics-repository-keyring.deb"
-SYNAPTICS_KEYRING_DEB="/tmp/synaptics-repository-keyring.deb"
+# Synaptics 官方下载页（standalone 安装包，含最新 .zip/.run 下载地址）
+DISPLAYLINK_SITE="https://www.synaptics.com"
+DISPLAYLINK_DL_PAGE="${DISPLAYLINK_SITE}/products/displaylink-graphics/downloads/ubuntu"
+# 可选：直接指定安装包下载地址（--run-url 或环境变量 DISPLAYLINK_DOWNLOAD_URL）
+DISPLAYLINK_DOWNLOAD_URL="${DISPLAYLINK_DOWNLOAD_URL:-}"
+# 可选：本地安装包路径（--run-file）
+RUN_FILE_LOCAL=""
+# 临时工作目录（EXIT trap 负责清理）
+TMP_WORK_DIR=""
 
-# 官方下载页面（用于回退方案解析最新下载地址）
-SYNAPTICS_DL_PAGE="https://www.synaptics.com/products/displaylink-graphics/downloads/ubuntu"
+# 旧版 APT 方式遗留的仓库配置（仅用于识别与清理，本脚本不再添加）
+SYNAPTICS_APT_LIST="/etc/apt/sources.list.d/synaptics.list"
+SYNAPTICS_KEYRING="/usr/share/keyrings/synaptics-repository-keyring.gpg"
 
 # 服务 / 文件路径
 SERVICE_NAME="displaylink-driver.service"
-SERVICE_FILE="/lib/systemd/system/${SERVICE_NAME}"
+SERVICE_BASE="displaylink-driver"
+SERVICE_FILE="/usr/lib/systemd/system/${SERVICE_NAME}"
+SERVICE_FILE_LEGACY="/lib/systemd/system/${SERVICE_NAME}"
 INIT_SCRIPT="displaylink.sh"
 INIT_SCRIPT_LINK="/etc/init.d/${INIT_SCRIPT}"
 INITD_GENERATED="/etc/init.d/displaylink.generated"
@@ -49,8 +63,13 @@ RC_LOCAL="/etc/rc.local"
 RC5_LINK="/etc/rc5.d/S05displaylink"
 MODULES_LOAD_EVDI="/etc/modules-load.d/evdi.conf"
 MODPROBE_BLACKLIST="/etc/modprobe.d/displaylink-blacklist.conf"
-DISPLAYLINK_BIN="/usr/lib/displaylink-driver/DisplayLinkManager"
+DISPLAYLINK_BIN="/opt/displaylink/DisplayLinkManager"
+DISPLAYLINK_BIN_APT="/usr/lib/displaylink-driver/DisplayLinkManager"
+UDEV_RULE_MAIN="/usr/lib/udev/rules.d/99-displaylink.rules"
+UDEV_RULE_LEGACY="/etc/udev/rules.d/99-displaylink.rules"
 XORG_CONF="/etc/X11/xorg.conf.d/20-displaylink.conf"
+STATE_DIR="/var/lib/displaylink-mx"
+DRIVER_VERSION_FILE="${STATE_DIR}/driver-version"
 
 # 颜色输出（非 TTY 时禁用）
 if [ -t 1 ]; then
@@ -68,51 +87,96 @@ die()   { echo -e "${C_RED}[✗]${C_RST} $*" >&2; exit 1; }
 # ---------------------------------------------------------------------
 
 detect_init() {
-    # 返回 systemd / sysvinit（runit 同样走 sysvinit 分支，因为 MX 的
-    # 服务脚本仍位于 /etc/init.d + rc*.d，只是 PID 1 由 runit 接管）
-    if [ "$(ps -p 1 -o comm= 2>/dev/null)" = "systemd" ] || [ -d /run/systemd/system ]; then
+    # 返回 systemd / runit / sysvinit
+    local pid1 init_exe
+    pid1="$(ps -p 1 -o comm= 2>/dev/null || true)"
+    case "$pid1" in
+        systemd)                   echo "systemd"; return ;;
+        runit|runit-init|runsvdir) echo "runit";   return ;;
+    esac
+    init_exe="$(readlink -f /proc/1/exe 2>/dev/null || true)"
+    case "$init_exe" in
+        *runit*) echo "runit"; return ;;
+    esac
+    # MX 的 sysvinit 模式：PID 1 仍是 /sbin/init（sysvinit）
+    if [ -d /run/systemd/system ]; then
         echo "systemd"
         return
     fi
     echo "sysvinit"
 }
 
+installer_init_daemon() {
+    # 官方 installer 只接受 upstart / systemd / runit 三种取值
+    case "${1:-sysvinit}" in
+        systemd) echo "systemd" ;;
+        runit)   echo "runit" ;;
+        *)       echo "upstart" ;;
+    esac
+}
+
 need_cmd() { command -v "$1" >/dev/null 2>&1; }
 
+http_get() {
+    # 抓取网页内容（优先 curl）
+    local url="$1"
+    if need_cmd curl; then
+        curl -fsSL --connect-timeout 20 --max-time 90 -A "Mozilla/5.0" "$url"
+    else
+        wget -q -O - --timeout=90 --tries=2 --user-agent="Mozilla/5.0" "$url"
+    fi
+}
+
+http_download() {
+    local url="$1" out="$2"
+    if need_cmd curl; then
+        curl -fSL --retry 3 --connect-timeout 20 -A "Mozilla/5.0" -o "$out" "$url"
+    else
+        wget -O "$out" --tries=3 --timeout=60 --user-agent="Mozilla/5.0" "$url"
+    fi
+}
+
 install_pkgs() {
-    # 并行安装缺失的依赖（不阻塞交互）
+    # 安装缺失的系统依赖（已安装的自动跳过）
     local missing=()
-    local p
+    local p list=""
     for p in "$@"; do
         dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -q "install ok installed" \
             && continue
         missing+=("$p")
     done
     if [ "${#missing[@]}" -eq 0 ]; then
-        ok "系统依赖已齐全（${*// /, }）"
+        for p in "$@"; do list+="${p}, "; done
+        ok "系统依赖已齐全（${list%, }）"
         return
     fi
-    info "安装系统依赖：${missing[*]}"
+    for p in "${missing[@]}"; do list+="${p}, "; done
+    info "安装系统依赖：${list%, }"
+
     DEBIAN_FRONTEND=noninteractive apt-get update -y
     DEBIAN_FRONTEND=noninteractive apt-get install -y "${missing[@]}"
 }
 
 install_kernel_headers() {
-    # 当前内核的 headers 是 dkms 编译 evdi 的前提，必须确保存在
-    if [ -d "/usr/src/linux-headers-$(uname -r)" ]; then
-        ok "当前内核 headers 已存在（$(uname -r)）"
+    # 当前内核 headers 是 DKMS 编译 evdi 的前提，官方 installer 也会检查
+    # /lib/modules/$(uname -r)/build 是否存在
+    local kver
+    kver="$(uname -r)"
+    if [ -d "/lib/modules/${kver}/build" ] || [ -d "/usr/src/linux-headers-${kver}" ]; then
+        ok "当前内核 headers 已存在（${kver}）"
         return
     fi
-    info "当前内核缺少 headers，尝试安装 linux-headers-$(uname -r)"
-    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y "linux-headers-$(uname -r)"; then
-        # AHS 内核（如 7.2.13-1-liquorix-amd64）对应包名可能带 -ahs 或需用 meta 包
+
+    info "当前内核缺少 headers，尝试安装 linux-headers-${kver}"
+    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y "linux-headers-${kver}"; then
+        # AHS 内核（如 liquorix）对应包名可能不同，退回 meta 包
         DEBIAN_FRONTEND=noninteractive apt-get install -y linux-headers-liquorix-amd64 2>/dev/null \
             || warn "未能自动安装当前内核 headers，稍后重启进其他内核时可用"
     fi
 }
 
 setup_evdi_at_boot() {
-    # 1) evdi 内核模块开机加载（sysvinit 下最关键的一步；systemd 下也可用）
+    # 1) evdi 内核模块开机加载（sysvinit / runit 下最关键的一步；systemd 下也可用）
     if [ -f "$MODULES_LOAD_EVDI" ] && grep -q '^evdi$' "$MODULES_LOAD_EVDI"; then
         ok "evdi 开机加载已配置（${MODULES_LOAD_EVDI}）"
     else
@@ -146,16 +210,22 @@ setup_blacklist() {
 }
 
 setup_systemd_autostart() {
-    # systemd 分支：确保服务有 [Install] 段（官方包常常缺失，见
-    # displaylink-debian issue #42），然后 enable + start
-    if [ ! -f "$SERVICE_FILE" ]; then
+    # systemd 分支：官方 .run 安装的 displaylink-driver.service 没有 [Install]
+    # 段（见 service-installer.sh），补上后才能 enable
+    local service_file="$SERVICE_FILE"
+    if [ ! -f "$service_file" ] && [ -f "$SERVICE_FILE_LEGACY" ]; then
+        service_file="$SERVICE_FILE_LEGACY"
+    fi
+    if [ ! -f "$service_file" ]; then
         die "找不到 ${SERVICE_FILE}，请先安装 DisplayLink 驱动"
     fi
-    if ! grep -q '^\[Install\]' "$SERVICE_FILE"; then
-        info "为 ${SERVICE_FILE} 补充 [Install] 段"
-        sed -i '/RestartSec=5/a[Install]\nWantedBy=multi-user.target' "$SERVICE_FILE"
+
+    if ! grep -q '^\[Install\]' "$service_file"; then
+        info "为 ${service_file} 补充 [Install] 段"
+        printf '\n[Install]\nWantedBy=multi-user.target\n' >> "$service_file"
         systemctl daemon-reload
     fi
+
     systemctl enable "${SERVICE_NAME}" 2>/dev/null || true
     # 幂等启动
     systemctl restart "${SERVICE_NAME}" 2>/dev/null \
@@ -163,22 +233,81 @@ setup_systemd_autostart() {
     ok "systemd 服务已启用并尝试启动（${SERVICE_NAME}）"
 }
 
+setup_runit_autostart() {
+    # runit 分支（MX Linux 23+ 默认 init）：官方 .run 会创建
+    # /etc/runit/sv/displaylink-driver 服务，但默认带 down 标记（只在 udev
+    # 检测到设备时由 /opt/displaylink/udev.sh 执行 sv up）。要实现开机自启动，
+    # 需要把服务注册到 runsvdir 的服务目录并去掉 down 标记。
+    local svdir="" d
+    for d in /etc/runit/sv/${SERVICE_BASE} /etc/sv/${SERVICE_BASE}; do
+        if [ -d "$d" ]; then
+            svdir="$d"
+            break
+        fi
+    done
+    [ -n "$svdir" ] || return 1
+
+    local service_dir=""
+    service_dir="$(pgrep -a runsvdir 2>/dev/null \
+        | sed -nE 's~^.*-P[[:space:]]+([^[:space:]]+).*$~\1~p' \
+        | head -n 1 || true)"
+    if [ -z "$service_dir" ] || [ ! -d "$service_dir" ]; then
+        service_dir=""
+        for d in /etc/service /var/service /service /run/runit/service /run/service; do
+            if [ -d "$d" ]; then
+                service_dir="$d"
+                break
+            fi
+        done
+    fi
+    if [ -z "$service_dir" ]; then
+        warn "未找到 runsvdir 服务目录，无法注册 runit 服务"
+        return 1
+    fi
+
+    if [ -e "${service_dir}/${SERVICE_BASE}" ]; then
+        ok "runit 服务已注册：${service_dir}/${SERVICE_BASE}"
+    else
+        ln -sfn "$svdir" "${service_dir}/${SERVICE_BASE}"
+        ok "已把 runit 服务注册到 ${service_dir}/${SERVICE_BASE}"
+    fi
+
+    rm -f "${svdir}/down"
+    ok "已移除 ${svdir}/down（runit 开机自启动）"
+
+    if need_cmd sv; then
+        # sv up 同时用于校验服务是否真的被 runsvdir 监管
+        if sv up "${SERVICE_BASE}" >/dev/null 2>&1; then
+            ok "runit 服务已启动（sv up ${SERVICE_BASE}）"
+        else
+            warn "sv up ${SERVICE_BASE} 未成功，改用 init 脚本 / rc.local 兜底"
+            return 1
+        fi
+    fi
+    return 0
+}
+
 setup_sysvinit_autostart() {
-    # sysvinit / runit 分支（MX Linux 23+ 默认 init 是 runit）：
+    # runit（MX 23+ 默认）优先使用官方 .run 提供的 runit 服务
+    if [ "$INIT" = "runit" ] && setup_runit_autostart; then
+        return 0
+    fi
+
+    # sysvinit / runit 兜底分支：
     #  runit 不会执行 /etc/rc*.d 里的 S 链接，但 MX 默认提供一个 oneshot
     #  服务执行 /etc/rc.local。因此这里同时配置：
     #   1) /etc/init.d/displaylink.sh + update-rc.d（传统 sysvinit）
     #   2) /etc/rc.local 追加启动命令（runit 兜底）
-    local dlm_bin=""
-    for p in /usr/lib/displaylink-driver/DisplayLinkManager /opt/displaylink/DisplayLinkManager; do
+    local dlm_bin="" p
+    for p in "$DISPLAYLINK_BIN" "$DISPLAYLINK_BIN_APT"; do
         [ -x "$p" ] && dlm_bin="$p" && break
     done
     [ -z "$dlm_bin" ] && dlm_bin="$DISPLAYLINK_BIN"
 
     # 1) init 脚本（优先官方自带，否则自建）
     local candidate=""
-    for c in /opt/displaylink/displaylink.sh /usr/lib/displaylink-driver/displaylink.sh /etc/init.d/displaylink.sh; do
-        [ -f "$c" ] && candidate="$c" && break
+    for p in /opt/displaylink/displaylink.sh /usr/lib/displaylink-driver/displaylink.sh /etc/init.d/displaylink.sh; do
+        [ -f "$p" ] && candidate="$p" && break
     done
     if [ -n "$candidate" ]; then
         ln -sfn "$candidate" "$INIT_SCRIPT_LINK"
@@ -275,118 +404,240 @@ EOF
     ok "DisplayLink 服务启动检查完成"
 }
 
-install_from_run() {
-    # 备用方案：从 Synaptics 官方 .zip/.run 安装（APT 不可用/安装失败时）
-    # 参考 displaylink-debian 的成熟处理：--keep --noexec 解压 → 修正
-    # SYSTEMINITDAEMON 探测 → 手动执行官方 installer → 由本脚本接管自启动
-    info "== 回退：从官方 .run 安装包安装 =="
-    install_pkgs unzip wget
+resolve_download_url() {
+    # 解析官方最新 standalone 安装包地址（.zip / .run）
+    #
+    # 页面结构（2026 年现状）：
+    #   https://www.synaptics.com/products/displaylink-graphics/downloads/ubuntu
+    #     → /products/displaylink-usb-graphics-software-ubuntu-64?filetype=exe
+    #       → /sites/default/files/exe_files/<YYYY-MM>/...-EXE.zip
+    # 旧版页面则直接在下载页里给出 exe_files 链接，因此两种都兼容。
+    local base="$DISPLAYLINK_SITE"
+    local html verpage page_slug="" page exe_url
 
-    local tmp page_zip dl_url runfile
-    tmp="$(mktemp -d --suffix=.dlm)"
-    info "解析官方下载地址：${SYNAPTICS_DL_PAGE}"
-    page_zip="$(wget -q -O - --user-agent="Mozilla/5.0" "$SYNAPTICS_DL_PAGE" \
-        | grep -oE '"/sites/default/files/exe_files/[^"]+EXE[^"]*\.(zip|run)"' \
-        | head -n 1 | tr -d '"')"
-    [ -n "$page_zip" ] || die "无法解析官方下载地址（网络或页面结构变化）"
-    dl_url="https://www.synaptics.com${page_zip}"
-    info "官方下载地址：${dl_url}"
-
-    info "下载驱动（约 60-70 MB）……"
-    wget -q --user-agent="Mozilla/5.0" -O "$tmp/dl.zip" "$dl_url" \
-        || die "下载失败：${dl_url}"
-    ok "下载完成"
-
-    cd "$tmp"
-    unzip -o -q dl.zip
-    runfile="$(ls displaylink-driver-*.run 2>/dev/null | head -n 1)"
-    [ -n "$runfile" ] || die "解压后未找到 displaylink-driver-*.run"
-    chmod +x "$runfile"
-
-    # 解压驱动的自安装脚本（不安装，只提取内容）
-    "$runfile" --keep --noexec >/dev/null 2>&1 || true
-    local dir
-    dir="$(ls -d displaylink-driver-* 2>/dev/null | grep -v '\.run$' | head -n 1)"
-    if [ -n "$dir" ] && [ -f "$dir/displaylink-installer.sh" ]; then
-        # 修正 init 系统探测（MX 上是 runit/sysvinit，官方脚本探测不到会走默认）
-        sed -i 's/SYSTEMINITDAEMON=unknown/SYSTEMINITDAEMON=sysvinit/' \
-            "$dir/displaylink-installer.sh"
-        info "运行官方 installer（已适配 MX init 系统）……"
-        ( cd "$dir" && ./displaylink-installer.sh install ) >/dev/null 2>&1 || true
-    else
-        # 兜底：直接运行 .run（使用 --accept 自动同意 EULA）
-        info "运行官方安装器：${runfile} --accept"
-        "$runfile" --accept >/dev/null 2>&1 || true
+    # 0) 显式指定（--run-url / 环境变量 DISPLAYLINK_DOWNLOAD_URL）优先
+    if [ -n "$DISPLAYLINK_DOWNLOAD_URL" ]; then
+        echo "$DISPLAYLINK_DOWNLOAD_URL"
+        return 0
     fi
 
-    cd / && rm -rf "$tmp"
+    html="$(http_get "$DISPLAYLINK_DL_PAGE")" || return 1
+
+    # 1) 页面里直接给出 exe 包（旧版页面布局）
+    exe_url="$(grep -oE '/sites/default/files/exe_files/[^"]+EXE[^"]*\.(zip|run)' <<< "$html" \
+        | head -n 1 || true)"
+    if [ -n "$exe_url" ]; then
+        echo "${base}${exe_url}"
+        return 0
+    fi
+
+    # 2) 新版页面布局：主页面按“从新到旧”列出各版本子页面，按顺序尝试，
+    #    取第一个能解析出 exe 包的版本页（注意：版本号后缀如 64 / 611 不能
+    #    用数值大小比较，611 是 6.1.1）
+    while IFS= read -r page_slug; do
+        [ -n "$page_slug" ] || continue
+        verpage="${base}/products/displaylink-usb-graphics-software-ubuntu-${page_slug}?filetype=exe"
+        page="$(http_get "$verpage" 2>/dev/null || true)"
+        exe_url="$(grep -oE '/sites/default/files/exe_files/[^"]+EXE[^"]*\.(zip|run)' <<< "$page" \
+            | head -n 1 || true)"
+        if [ -n "$exe_url" ]; then
+            echo "${base}${exe_url}"
+            return 0
+        fi
+    done < <(grep -oE 'displaylink-usb-graphics-software-ubuntu-[0-9]+' <<< "$html" \
+        | sed 's/.*-ubuntu-//' | awk '!seen[$0]++')
+
+    return 1
+}
+
+install_from_run() {
+    info "== 从官方 standalone 安装包（.run）安装 DisplayLink =="
+
+    # 官方 installer 会检查这些依赖，并可能弹出 apt 交互询问；
+    # 预先装好可以保证安装过程全自动
+    if ! install_pkgs wget curl ca-certificates unzip lsb-release dkms build-essential \
+                     pkg-config libdrm-dev libc6-dev coreutils mokutil; then
+        die "系统依赖安装失败，请先修复 apt 源（apt update）后重试"
+    fi
+    install_kernel_headers
+
+    local tmp workdir archive=""
+    tmp="$(mktemp -d --suffix=.dlm)"
+    TMP_WORK_DIR="$tmp"
+    trap 'if [ -n "${TMP_WORK_DIR:-}" ]; then rm -rf "$TMP_WORK_DIR"; fi' EXIT
+    workdir="${tmp}/extract"
+    mkdir -p "$workdir"
+
+    if [ -n "$RUN_FILE_LOCAL" ]; then
+        [ -f "$RUN_FILE_LOCAL" ] || die "指定的安装包不存在：${RUN_FILE_LOCAL}"
+        archive="$RUN_FILE_LOCAL"
+        info "使用本地安装包：${archive}"
+    else
+        local url
+        url="$(resolve_download_url)" \
+            || die "无法解析官方下载地址（网络问题或页面结构变化），可用 --run-url / --run-file 指定"
+        info "官方下载地址：${url}"
+        case "$url" in
+            *.zip|*.ZIP) archive="${tmp}/download.zip" ;;
+            *)           archive="${tmp}/download.run" ;;
+        esac
+        info "下载安装包（约 20-70 MB）……"
+        http_download "$url" "$archive" || die "下载失败：${url}"
+        ok "下载完成（$(du -h "$archive" | awk '{print $1}')）"
+    fi
+
+    case "$archive" in
+        *.zip|*.ZIP)
+            info "解压 .zip 安装包"
+            unzip -o -q "$archive" -d "$workdir" || die "解压失败：${archive}"
+            ;;
+        *)
+            cp -f "$archive" "$workdir/" || die "复制安装包失败：${archive}"
+            ;;
+    esac
+
+    local runfile
+    runfile="$(find "$workdir" -maxdepth 3 -type f -name 'displaylink-driver-*.run' -print -quit)"
+    [ -n "$runfile" ] || die "安装包内未找到 displaylink-driver-*.run"
+    chmod +x "$runfile"
+    ok "安装包：$(basename "$runfile")"
+
+    # --keep --noexec：只解压不执行，便于先做 MX 适配再运行官方 installer
+    # --nox11：stdout 不是 TTY（如脚本里重定向日志）时，makeself 默认会尝试
+    #          打开图形终端重新执行，这里必须禁用
+    local runbase runbasedir
+    local -a run_args=(--keep --noexec)
+    runbase="$(basename "$runfile")"
+    runbasedir="$(dirname "$runfile")"
+    if grep -qa -- '--nox11' "$runfile"; then
+        run_args+=(--nox11)
+    fi
+    # --accept：老版本 .run 解压前会要求同意 EULA，自动接受可避免卡住
+    if grep -qa -- '--accept' "$runfile"; then
+        run_args+=(--accept)
+    fi
+    ( cd "$runbasedir" && ./"$runbase" "${run_args[@]}" ) >/dev/null 2>&1 || true
+
+    local installer
+    installer="$(find "$workdir" -maxdepth 4 -type f -name 'displaylink-installer.sh' -print -quit)"
+    [ -n "$installer" ] || die "未能从 .run 中提取 displaylink-installer.sh"
+    chmod +x "$installer"
+    ok "已提取官方安装器"
+
+    local init_daemon
+    init_daemon="$(installer_init_daemon "$INIT")"
+
+    # 6.x 的官方 installer 在 Debian 系上会询问 “Do you want to install
+    # with apt?”，默认回答 Y 会走 Synaptics APT 仓库。这里直接改掉该判断，
+    # 强制走 standalone（.run）安装路径。
+    if grep -q 'prompt_yes_no "Do you want to install with apt?"' "$installer"; then
+        sed -i 's#if program_exists apt && prompt_yes_no "Do you want to install with apt?"; then#if false; then#' "$installer"
+        ok "已强制使用 standalone（.run）安装路径（跳过官方 apt 方式）"
+    fi
+
+    # 官方 installer 的交互问题一律回答 n（不使用 apt / 不立即重启）；
+    # 新版支持 noreboot 参数，老版本用应答兜底
+    local -a args=(install)
+    local -a answers=(n)
+    if grep -q 'noreboot)' "$installer"; then
+        args+=(noreboot)
+    else
+        answers+=(n)
+    fi
+
+    info "运行官方安装器（init=${init_daemon}，日志：${LOG_FILE}）……"
+    local rc=0
+    (
+        cd "$(dirname "$installer")" \
+            && printf '%s\n' "${answers[@]}" \
+            | SYSTEMINITDAEMON="$init_daemon" ./displaylink-installer.sh "${args[@]}"
+    ) 2>&1 | tee -a "$LOG_FILE" || rc=$?
+
+    if [ -x "$DISPLAYLINK_BIN" ]; then
+        local dlm_ver
+        dlm_ver="$("$DISPLAYLINK_BIN" -version 2>/dev/null | head -n 1 || true)"
+        mkdir -p "$STATE_DIR"
+        printf '%s\n' "${dlm_ver:-unknown}" > "$DRIVER_VERSION_FILE"
+        [ "$rc" -eq 0 ] || warn "官方安装器返回码 ${rc}，请检查日志：${LOG_FILE}"
+        ok "DisplayLink 安装完成${dlm_ver:+（${dlm_ver}）}"
+    else
+        warn "官方安装器未生成 ${DISPLAYLINK_BIN}（返回码 ${rc}）"
+        warn "日志：${LOG_FILE}"
+        die "DisplayLink 安装失败"
+    fi
+
+    rm -rf "$tmp"
+    TMP_WORK_DIR=""
 }
 
 ensure_driver_installed() {
-    # 统一入口：确保已安装 displaylink-driver（APT 或 /opt/displaylink 均可）
-    if [ -x "$DISPLAYLINK_BIN" ] \
-        && dpkg-query -W -f='${Status}' displaylink-driver 2>/dev/null | grep -q "install ok installed"; then
-        ok "检测到已安装的 displaylink-driver（APT 版本）"
+    # 统一入口：确保已安装 DisplayLink（.run 方式优先）
+    if [ -x "$DISPLAYLINK_BIN" ]; then
+        local dlm_ver
+        dlm_ver="$("$DISPLAYLINK_BIN" -version 2>/dev/null | head -n 1 || true)"
+        if [ -n "$dlm_ver" ]; then
+            mkdir -p "$STATE_DIR"
+            printf '%s\n' "$dlm_ver" > "$DRIVER_VERSION_FILE"
+        fi
+        ok "检测到已安装的 DisplayLink（.run 方式：${DISPLAYLINK_BIN}）"
         return 0
     fi
-    if [ -x /opt/displaylink/DisplayLinkManager ]; then
-        ok "检测到已安装的 DisplayLink（/opt/displaylink，.run 方式）"
-        return 0
+
+    # 旧的 APT 安装方式会与本脚本的 .run 方式冲突（重复的 udev 规则/服务），先卸载
+    if dpkg-query -W -f='${Status}' displaylink-driver 2>/dev/null | grep -q "install ok installed"; then
+        warn "检测到旧的 APT 版本 displaylink-driver，与 .run 方式冲突，先卸载"
+        DEBIAN_FRONTEND=noninteractive apt-get purge -y displaylink-driver 2>/dev/null || true
+        rm -f "$SYNAPTICS_APT_LIST" "$SYNAPTICS_KEYRING"
+        ok "已移除旧 APT 版本与 Synaptics APT 仓库配置"
     fi
 
-    info "未检测到 DisplayLink 驱动，开始安装……"
-
-    # 1) 添加 Synaptics 官方 APT 仓库（若尚未添加）
-    if [ -f /etc/apt/sources.list.d/synaptics.list ] \
-        && grep -q 'synaptics.com' /etc/apt/sources.list.d/synaptics.list 2>/dev/null; then
-        info "检测到 Synaptics APT 源，跳过添加"
-    else
-        info "添加 Synaptics 官方 APT 仓库……"
-        command -v wget >/dev/null 2>&1 || DEBIAN_FRONTEND=noninteractive apt-get install -y wget
-        wget -q -O "$SYNAPTICS_KEYRING_DEB" "$SYNAPTICS_KEYRING_URL" \
-            || die "下载 Synaptics 官方 APT 密钥失败：${SYNAPTICS_KEYRING_URL}"
-        DEBIAN_FRONTEND=noninteractive apt-get install -y "$SYNAPTICS_KEYRING_DEB" \
-            || die "安装 Synaptics 官方 APT 密钥失败"
-        echo "$SYNAPTICS_APT_LINE" > /etc/apt/sources.list.d/synaptics.list
-        ok "已添加 Synaptics 官方 APT 仓库"
-    fi
-
-    # 2) 安装依赖（DKMS 需要当前内核 headers）
-    install_pkgs dkms evdi-dkms wget unzip
-    install_kernel_headers
-
-    # 3) 安装驱动本体
-    if DEBIAN_FRONTEND=noninteractive apt-get update -y \
-        && DEBIAN_FRONTEND=noninteractive apt-get install -y displaylink-driver; then
-        ok "displaylink-driver 安装完成（APT 方式）"
-    else
-        warn "APT 安装失败，尝试官方 .run 安装包……"
-        install_from_run
-    fi
+    info "未检测到 DisplayLink 驱动，开始下载并运行官方 .run 安装包……"
+    install_from_run
 }
 
 pull_evdi_dkms() {
-    # 确保 evdi-dkms 已安装（MX/社区维护的 DKMS 包装，已随上面依赖装好）
-    if dpkg-query -W -f='${Status}' evdi-dkms 2>/dev/null | grep -q "install ok installed"; then
-        ok "evdi-dkms 已安装"
-        # 确保当前内核已编译
-        if ! lsmod | grep -q '^evdi' && [ -d "/usr/src/linux-headers-$(uname -r)" ]; then
-            info "为当前内核编译 evdi 内核模块（DKMS）……"
-            dkms autoinstall -k "$(uname -r)" 2>/dev/null || true
-        fi
+    # 官方 .run 安装包自带 evdi 源码，安装时会用 DKMS 编译并安装
+    if modinfo evdi >/dev/null 2>&1; then
+        ok "evdi 内核模块已就绪（$(modinfo -F version evdi 2>/dev/null || echo '来自官方 .run')）"
+        return 0
+    fi
+
+    # 回退：使用发行版（MX/Debian 仓库，非 Synaptics 仓库）的 evdi-dkms
+    warn "未检测到 evdi 内核模块，尝试安装发行版的 evdi-dkms 作为回退"
+    if ! install_pkgs dkms evdi-dkms; then
+        warn "发行版仓库未提供 evdi-dkms（或安装失败），重启后重新运行本脚本即可"
+        return 0
+    fi
+    install_kernel_headers
+    dkms autoinstall -k "$(uname -r)" 2>/dev/null || true
+    if modinfo evdi >/dev/null 2>&1; then
+        ok "evdi 内核模块已就绪（evdi-dkms）"
     else
-        install_pkgs evdi-dkms
-        install_kernel_headers
+        warn "evdi 仍不可用：若刚更新过内核，重启后重新运行本脚本即可"
     fi
 }
 
 uninstall_all() {
     info "=== 卸载 DisplayLink ==="
-    # 停止所有入口
-    systemctl disable "${SERVICE_NAME}" 2>/dev/null || true
+    local init_daemon
+    init_daemon="$(installer_init_daemon "$INIT")"
+
+    # 1) 官方卸载器（.run 方式）：停服务、移除 evdi DKMS、udev 规则等
+    if [ -x /opt/displaylink/displaylink-installer.sh ]; then
+        info "运行官方卸载器（/opt/displaylink/displaylink-installer.sh）"
+        ( SYSTEMINITDAEMON="$init_daemon" /opt/displaylink/displaylink-installer.sh uninstall ) \
+            >> "$LOG_FILE" 2>&1 || warn "官方卸载器返回非零状态，继续执行兜底清理"
+    fi
+
+    # 2) 停止所有入口
     systemctl stop "${SERVICE_NAME}" 2>/dev/null || true
+    systemctl disable "${SERVICE_NAME}" 2>/dev/null || true
+    if need_cmd sv; then
+        sv down "${SERVICE_BASE}" 2>/dev/null || true
+    fi
     update-rc.d displaylink.sh remove >/dev/null 2>&1 || true
     rm -f "$RC5_LINK"
+    pkill -f 'DisplayLinkManager' 2>/dev/null || true
 
     # 清理 rc.local 中的注册行（若有）
     if [ -f "$RC_LOCAL" ]; then
@@ -394,40 +645,73 @@ uninstall_all() {
         ok "已从 ${RC_LOCAL} 移除 displaylink 启动行"
     fi
 
-    pkill -f 'DisplayLinkManager' 2>/dev/null || true
-
-    # 卸载 APT 包
-    DEBIAN_FRONTEND=noninteractive apt-get purge -y displaylink-driver evdi-dkms 2>/dev/null || true
-
-    # 卸载 .run 安装（如有）
-    if [ -f /opt/displaylink/uninstall.sh ]; then
-        (cd /opt/displaylink && ./uninstall.sh) 2>/dev/null || true
+    # 3) 兼容历史 APT 安装与 Synaptics APT 仓库残留
+    rm -f "$SYNAPTICS_APT_LIST" "$SYNAPTICS_KEYRING" /tmp/synaptics-repository-keyring.deb
+    if dpkg-query -W -f='${Status}' displaylink-driver 2>/dev/null | grep -q "install ok installed"; then
+        DEBIAN_FRONTEND=noninteractive apt-get purge -y displaylink-driver 2>/dev/null || true
     fi
 
-    # 清理自启动与黑名单
-    rm -f "$MODULES_LOAD_EVDI" "$INIT_SCRIPT_LINK" "$INITD_GENERATED"
-    rm -f "$MODPROBE_BLACKLIST"
+    # 4) 兜底清理官方安装器写入的文件
+    rm -rf /opt/displaylink
+    rm -f /usr/bin/displaylink-installer /usr/bin/DLSupportTool.sh
+    rm -f "$UDEV_RULE_MAIN" "$UDEV_RULE_LEGACY"
+    rm -f "$SERVICE_FILE" "$SERVICE_FILE_LEGACY" /lib/systemd/system-sleep/displaylink.sh
+    rm -rf "/etc/runit/sv/${SERVICE_BASE}" "/etc/sv/${SERVICE_BASE}"
+    rm -f "/etc/service/${SERVICE_BASE}" "/var/service/${SERVICE_BASE}" "/service/${SERVICE_BASE}"
+    rm -rf /var/log/displaylink
+
+    # 5) 清理自启动与黑名单
+    rm -f "$MODULES_LOAD_EVDI" "$INIT_SCRIPT_LINK" "$INITD_GENERATED" "$MODPROBE_BLACKLIST"
+    rm -rf "$STATE_DIR"
     systemctl daemon-reload 2>/dev/null || true
-    ok "卸载完成"
+    udevadm control --reload-rules 2>/dev/null || true
+    ok "卸载完成（若本脚本曾回退安装 evdi-dkms，可用 apt purge evdi-dkms 移除）"
 }
 
 show_status() {
     info "=== DisplayLink 状态 ==="
+    local init_kind
+    init_kind="$(detect_init)"
+
     # 服务
-    if [ "$(detect_init)" = "systemd" ]; then
-        if systemctl is-enabled "${SERVICE_NAME}" >/dev/null 2>&1; then
-            echo "服务：systemd 已启用（${SERVICE_NAME}）"
-        else
-            echo "服务：systemd 未启用"
-        fi
-    else
-        # sysvinit：检查 rc5 的 S 链接是否指向我们的 init 脚本
-        if [ -L "$RC5_LINK" ] || ls /etc/rc*.d/ 2>/dev/null | grep -qi displaylink; then
-            echo "服务：sysvinit 已启用（rc*.d 有链接）"
-        else
-            echo "服务：sysvinit 未启用"
-        fi
-    fi
+    case "$init_kind" in
+        systemd)
+            if systemctl is-enabled "${SERVICE_NAME}" >/dev/null 2>&1; then
+                echo "服务：systemd 已启用（${SERVICE_NAME}）"
+            else
+                echo "服务：systemd 未启用"
+            fi
+            ;;
+        runit)
+            local svdir="" d
+            for d in /etc/runit/sv/${SERVICE_BASE} /etc/sv/${SERVICE_BASE}; do
+                if [ -d "$d" ]; then
+                    svdir="$d"
+                    break
+                fi
+            done
+            if [ -n "$svdir" ]; then
+                if [ -e "${svdir}/down" ]; then
+                    echo "服务：runit 已注册（带 down 标记，插拔设备时由 udev 启动）"
+                else
+                    echo "服务：runit 已启用（开机自启动）"
+                fi
+            elif grep -qs "${INIT_SCRIPT_LINK} start" "$RC_LOCAL" || [ -L "$RC5_LINK" ]; then
+                echo "服务：runit 无原生服务，已用 init 脚本 + rc.local 兜底"
+            else
+                echo "服务：未发现 runit 服务（${SERVICE_BASE}）"
+            fi
+            ;;
+        *)
+            # sysvinit：检查 rc5 的 S 链接是否指向我们的 init 脚本
+            if [ -L "$RC5_LINK" ] || ls /etc/rc*.d/ 2>/dev/null | grep -qi displaylink; then
+                echo "服务：sysvinit 已启用（rc*.d 有链接）"
+            else
+                echo "服务：sysvinit 未启用"
+            fi
+            ;;
+    esac
+
     # 进程
     if pgrep -f 'DisplayLinkManager' >/dev/null; then
         echo "进程：$(pgrep -af 'DisplayLinkManager' | head -n 3 | tr '\n' '; ')"
@@ -436,8 +720,21 @@ show_status() {
     fi
     # 内核模块
     lsmod | grep -q '^evdi' && echo "内核模块：evdi 已加载" || echo "内核模块：evdi 未加载"
+    if need_cmd dkms; then
+        local dkms_evdi
+        dkms_evdi="$(dkms status 2>/dev/null | grep -i evdi | head -n 1 || true)"
+        [ -n "$dkms_evdi" ] && echo "DKMS：${dkms_evdi}"
+    fi
+
     # 版本
-    dpkg-query -W -f='驱动版本：${Version}\n' displaylink-driver 2>/dev/null || true
+    if [ -x "$DISPLAYLINK_BIN" ]; then
+        local dlm_ver
+        dlm_ver="$("$DISPLAYLINK_BIN" -version 2>/dev/null | head -n 1 || true)"
+        echo "驱动版本：${dlm_ver:-未知}（.run 方式）"
+    elif [ -f "$DRIVER_VERSION_FILE" ]; then
+        echo "驱动版本：$(cat "$DRIVER_VERSION_FILE")（.run 方式）"
+    fi
+    dpkg-query -W -f='驱动版本：${Version}（旧 APT 方式）\n' displaylink-driver 2>/dev/null || true
     if [ -f /sys/devices/evdi/version ]; then
         echo "evdi 版本：$(cat /sys/devices/evdi/version)"
     fi
@@ -455,6 +752,7 @@ show_status() {
 }
 
 reboot_dialog() {
+    local ans
     echo
     read -r -p "是否立即重启使所有更改生效？[y/N] " ans
     case "$ans" in
@@ -468,23 +766,39 @@ reboot_dialog() {
     esac
 }
 
-# ---------------------------------------------------------------------
-# 主流程
-# ---------------------------------------------------------------------
 main() {
-    # 参数解析（先于 root 检查，便于 --help / --status 普通用户使用）
+    # 参数解析（先于 root 检查，便于 --help 普通用户使用）
     local MODE="install"
-    case "${1:-}" in
-        --uninstall) MODE="uninstall" ;;
-        --status)    MODE="status" ;;
-        --help|-h)   MODE="help" ;;
-    esac
+
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --uninstall) MODE="uninstall" ;;
+            --status)    MODE="status" ;;
+            --help|-h)   MODE="help" ;;
+            --run-file)
+                [ "$#" -ge 2 ] || die "--run-file 需要一个 .zip / .run 文件路径"
+                RUN_FILE_LOCAL="$2"
+                shift
+                ;;
+            --run-file=*) RUN_FILE_LOCAL="${1#*=}" ;;
+            --run-url)
+                [ "$#" -ge 2 ] || die "--run-url 需要一个下载地址"
+                DISPLAYLINK_DOWNLOAD_URL="$2"
+                shift
+                ;;
+            --run-url=*) DISPLAYLINK_DOWNLOAD_URL="${1#*=}" ;;
+            *) die "未知参数：$1（用 --help 查看用法）" ;;
+        esac
+        shift
+    done
 
     if [ "$MODE" = "help" ]; then
         echo "用法："
-        echo "  sudo $0                安装 + 配置开机自启动（幂等）"
-        echo "  sudo $0 --status      只查看当前状态"
-        echo "  sudo $0 --uninstall   彻底卸载"
+        echo "  sudo $0                       下载官方 .run 安装包安装 + 配置开机自启动"
+        echo "  sudo $0 --run-file FILE       使用本地 .zip / .run 安装包（离线安装）"
+        echo "  sudo $0 --run-url URL         指定 .zip / .run 下载地址"
+        echo "  sudo $0 --status              只查看当前状态"
+        echo "  sudo $0 --uninstall           彻底卸载"
         exit 0
     fi
 
@@ -495,7 +809,7 @@ main() {
 
     INIT="$(detect_init)"
     info "=== DisplayLink MX Linux 安装脚本 v${VERSION} ==="
-    info "发行版：$(lsb_release -ds 2>/dev/null || grep PRETTY_NAME /etc/os-release | cut -d= -f2 | tr -d '"')"
+    info "发行版：$(lsb_release -ds 2>/dev/null || grep PRETTY_NAME /etc/os-release | cut -d= -f2 | tr -d '\"')"
     info "内核：$(uname -r)"
     info "init 系统：${INIT}"
 
@@ -514,15 +828,15 @@ main() {
 
     # 1) 系统依赖
     info "== 检查系统依赖 =="
-    install_pkgs lsb-release wget curl ca-certificates xz-utils
+    install_pkgs lsb-release wget curl ca-certificates unzip
     install_kernel_headers
 
-    # 2) 安装驱动（已装则自动跳过；APT 不可用时会回退 .run）
-    info "== 检查 / 安装 DisplayLink 驱动 =="
+    # 2) 安装驱动（下载官方 .run 安装包并运行官方 installer；已装则跳过）
+    info "== 检查 / 安装 DisplayLink 驱动（官方 .run） =="
     ensure_driver_installed
 
-    # 3) evdi-dkms（DKMS 内核模块）
-    info "== 准备 evdi 内核模块（DKMS） =="
+    # 3) evdi 内核模块（官方 installer 已用 DKMS 编译；缺失时用 evdi-dkms 回退）
+    info "== 检查 evdi 内核模块（DKMS） =="
     pull_evdi_dkms
 
     # 4) 配置开机自启动（按 init 系统分支）
@@ -549,6 +863,7 @@ main() {
 
     echo
     info "日志：${LOG_FILE}"
+    info "官方安装器日志：/var/log/displaylink/displaylink_installer.log"
     info "如需卸载：sudo $0 --uninstall"
 }
 
